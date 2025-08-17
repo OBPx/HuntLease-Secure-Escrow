@@ -67,7 +67,9 @@
 (define-public (list-lease (amount-ustx uint) (details-uri (string-ascii 128)))
   (begin
     (asserts! (> amount-ustx u0) ERR_INVALID_AMOUNT)
-    (let ((lease-id (+ u1 (var-get last-lease-id))))
+    (asserts! (> (len details-uri) u0) ERR_INVALID_AMOUNT) ;; URI cannot be empty
+    (let ((lease-id (+ u1 (var-get last-lease-id)))
+          (validated-uri (if (is-eq (len details-uri) u0) "" details-uri))) ;; Validate URI
       (map-set leases lease-id {
         landowner: tx-sender,
         hunter: tx-sender, ;; Placeholder until funded
@@ -75,7 +77,7 @@
         status: STATUS_LISTED,
         landowner-confirmed: false,
         hunter-confirmed: false,
-        details-uri: details-uri
+        details-uri: validated-uri
       })
       (var-set last-lease-id lease-id)
       (print { message: "lease listed", id: lease-id })
@@ -90,7 +92,7 @@
   (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
     (asserts! (is-eq (get status lease) STATUS_LISTED) ERR_INVALID_LEASE_STATE)
     (asserts! (not (is-eq tx-sender (get landowner lease))) ERR_NOT_AUTHORIZED) ;; Hunter cannot be the landowner
-    
+
     (let ((amount (get amount lease)))
       (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
       (map-set leases lease-id (merge lease { 
@@ -126,21 +128,21 @@
     (let ((is-landowner (is-eq tx-sender (get landowner lease)))
           (current-landowner-confirmed (get landowner-confirmed lease))
           (current-hunter-confirmed (get hunter-confirmed lease)))
-      
+
       ;; Check if already confirmed by this party
       (asserts! (if is-landowner 
                    (not current-landowner-confirmed)
                    (not current-hunter-confirmed)) 
                 ERR_LEASE_ALREADY_CONFIRMED)
-      
+
       (let ((updated-lease
               (if is-landowner
                 (merge lease { landowner-confirmed: true })
                 (merge lease { hunter-confirmed: true }))))
-        
+
         (map-set leases lease-id updated-lease)
         (print { message: "completion confirmed", id: lease-id, confirmer: tx-sender })
-        
+
         ;; Try to release funds if both parties have confirmed
         (let ((both-confirmed (if is-landowner
                                  (get hunter-confirmed lease)
@@ -203,20 +205,20 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
     (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
       (asserts! (is-eq (get status lease) STATUS_DISPUTED) ERR_INVALID_LEASE_STATE)
-      
+
       (let ((total-amount (get amount lease))
             (fee-percent (var-get service-fee-percent))
             (service-fee (/ (* total-amount fee-percent) u100))
             (payout-amount (- total-amount service-fee))
             (recipient (if release-to-landowner (get landowner lease) (get hunter lease))))
-        
+
         (asserts! (> payout-amount u0) ERR_INVALID_AMOUNT)
-        
+
         ;; Transfer service fee to contract owner
         (try! (as-contract (stx-transfer? service-fee tx-sender CONTRACT_OWNER)))
         ;; Transfer payout to designated recipient
         (try! (as-contract (stx-transfer? payout-amount tx-sender recipient)))
-        
+
         (map-set leases lease-id (merge lease { status: STATUS_COMPLETED }))
         (print { message: "dispute resolved", id: lease-id, recipient: recipient, amount: payout-amount })
         (ok true)
@@ -234,12 +236,12 @@
   (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
     (asserts! (and (get landowner-confirmed lease) (get hunter-confirmed lease)) ERR_INVALID_LEASE_STATE)
     (asserts! (is-eq (get status lease) STATUS_ACTIVE) ERR_INVALID_LEASE_STATE)
-    
+
     (let ((total-amount (get amount lease))
           (fee-percent (var-get service-fee-percent))
           (service-fee (/ (* total-amount fee-percent) u100))
           (payout-amount (- total-amount service-fee)))
-      
+
       (asserts! (> payout-amount u0) ERR_INVALID_AMOUNT)
 
       ;; Transfer service fee to contract owner
