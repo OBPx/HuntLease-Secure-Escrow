@@ -8,14 +8,15 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define-constant CONTRACT_OWNER tx-sender)
-(define-constant ERR_NOT_AUTHORIZED u101)
-(define-constant ERR_LEASE_NOT_FOUND u102)
-(define-constant ERR_INVALID_LEASE_STATE u103)
-(define-constant ERR_INVALID_AMOUNT u104)
-(define-constant ERR_FUNDS_NOT_RECEIVED u105)
-(define-constant ERR_LEASE_ALREADY_CONFIRMED u106)
-(define-constant ERR_LEASE_EXPIRED u107) ;; Placeholder for future time-based logic
-(define-constant ERR_PAYMENT_FAILED u108)
+(define-constant ERR_NOT_AUTHORIZED (err u101))
+(define-constant ERR_LEASE_NOT_FOUND (err u102))
+(define-constant ERR_INVALID_LEASE_STATE (err u103))
+(define-constant ERR_INVALID_AMOUNT (err u104))
+(define-constant ERR_FUNDS_NOT_RECEIVED (err u105))
+(define-constant ERR_LEASE_ALREADY_CONFIRMED (err u106))
+(define-constant ERR_LEASE_EXPIRED (err u107)) ;; Placeholder for future time-based logic
+(define-constant ERR_PAYMENT_FAILED (err u108))
+(define-constant ERR_TRANSFER_FAILED (err u109))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Data Storage
@@ -50,9 +51,10 @@
 ;; Allows the contract owner to adjust the service fee percentage.
 (define-public (set-service-fee (new-fee-percent uint))
   (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
-    (asserts! (<= new-fee-percent u10) (err ERR_INVALID_AMOUNT)) ;; Max 10%
-    (ok (var-set service-fee-percent new-fee-percent))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-fee-percent u10) ERR_INVALID_AMOUNT) ;; Max 10%
+    (var-set service-fee-percent new-fee-percent)
+    (ok true)
   )
 )
 
@@ -64,7 +66,7 @@
 ;; A landowner lists a property for lease.
 (define-public (list-lease (amount-ustx uint) (details-uri (string-ascii 128)))
   (begin
-    (asserts! (> amount-ustx u0) (err ERR_INVALID_AMOUNT))
+    (asserts! (> amount-ustx u0) ERR_INVALID_AMOUNT)
     (let ((lease-id (+ u1 (var-get last-lease-id))))
       (map-set leases lease-id {
         landowner: tx-sender,
@@ -85,13 +87,17 @@
 ;; --- Fund a Lease (Hunter's action) ---
 ;; A hunter funds a listed lease, moving it to the FUNDED state.
 (define-public (fund-lease (lease-id uint))
-  (let ((lease (unwrap! (map-get? leases lease-id) (err ERR_LEASE_NOT_FOUND))))
-    (asserts! (is-eq (get status lease) STATUS_LISTED) (err ERR_INVALID_LEASE_STATE))
-
+  (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+    (asserts! (is-eq (get status lease) STATUS_LISTED) ERR_INVALID_LEASE_STATE)
+    (asserts! (not (is-eq tx-sender (get landowner lease))) ERR_NOT_AUTHORIZED) ;; Hunter cannot be the landowner
+    
     (let ((amount (get amount lease)))
-      (stx-transfer? amount tx-sender (as-contract tx-sender))
-      (map-set leases lease-id (merge lease { hunter: tx-sender, status: STATUS_FUNDED }))
-      (print { message: "lease funded", id: lease-id })
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (map-set leases lease-id (merge lease { 
+        hunter: tx-sender, 
+        status: STATUS_FUNDED 
+      }))
+      (print { message: "lease funded", id: lease-id, hunter: tx-sender })
       (ok true)
     )
   )
@@ -100,9 +106,9 @@
 ;; --- Activate Lease (Landowner's action) ---
 ;; Landowner acknowledges funding and activates the lease period.
 (define-public (activate-lease (lease-id uint))
-  (let ((lease (unwrap! (map-get? leases lease-id) (err ERR_LEASE_NOT_FOUND))))
-    (asserts! (is-eq tx-sender (get landowner lease)) (err ERR_NOT_AUTHORIZED))
-    (asserts! (is-eq (get status lease) STATUS_FUNDED) (err ERR_INVALID_LEASE_STATE))
+  (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get landowner lease)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status lease) STATUS_FUNDED) ERR_INVALID_LEASE_STATE)
 
     (map-set leases lease-id (merge lease { status: STATUS_ACTIVE }))
     (print { message: "lease activated", id: lease-id })
@@ -113,22 +119,41 @@
 ;; --- Confirm Completion ---
 ;; Landowner or hunter confirms the lease was completed successfully.
 (define-public (confirm-completion (lease-id uint))
-  (let ((lease (unwrap! (map-get? leases lease-id) (err ERR_LEASE_NOT_FOUND)))
-        (sender tx-sender))
+  (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender (get landowner lease)) (is-eq tx-sender (get hunter lease))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status lease) STATUS_ACTIVE) ERR_INVALID_LEASE_STATE)
 
-    (asserts! (or (is-eq sender (get landowner lease)) (is-eq sender (get hunter lease))) (err ERR_NOT_AUTHORIZED))
-    (asserts! (is-eq (get status lease) STATUS_ACTIVE) (err ERR_INVALID_LEASE_STATE))
-
-    (let ((is-landowner (is-eq sender (get landowner lease)))
-          (is-hunter (is-eq sender (get hunter lease)))
-          (updated-lease
-            (if is-landowner
-              (merge lease { landowner-confirmed: true })
-              (merge lease { hunter-confirmed: true }))))
-
-      (map-set leases lease-id updated-lease)
-      (try! (release-funds-if-confirmed lease-id))
-      (ok true)
+    (let ((is-landowner (is-eq tx-sender (get landowner lease)))
+          (current-landowner-confirmed (get landowner-confirmed lease))
+          (current-hunter-confirmed (get hunter-confirmed lease)))
+      
+      ;; Check if already confirmed by this party
+      (asserts! (if is-landowner 
+                   (not current-landowner-confirmed)
+                   (not current-hunter-confirmed)) 
+                ERR_LEASE_ALREADY_CONFIRMED)
+      
+      (let ((updated-lease
+              (if is-landowner
+                (merge lease { landowner-confirmed: true })
+                (merge lease { hunter-confirmed: true }))))
+        
+        (map-set leases lease-id updated-lease)
+        (print { message: "completion confirmed", id: lease-id, confirmer: tx-sender })
+        
+        ;; Try to release funds if both parties have confirmed
+        (let ((both-confirmed (if is-landowner
+                                 (get hunter-confirmed lease)
+                                 current-landowner-confirmed)))
+          (if both-confirmed
+            (begin
+              (try! (release-funds lease-id))
+              (ok true)
+            )
+            (ok true)
+          )
+        )
+      )
     )
   )
 )
@@ -136,18 +161,64 @@
 ;; --- Cancel Lease (Before Activation) ---
 ;; Either party can cancel before the lease is active. Hunter gets a full refund.
 (define-public (cancel-lease (lease-id uint))
-  (let ((lease (unwrap! (map-get? leases lease-id) (err ERR_LEASE_NOT_FOUND))))
-    (asserts! (or (is-eq tx-sender (get landowner lease)) (is-eq tx-sender (get hunter lease))) (err ERR_NOT_AUTHORIZED))
-    (asserts! (or (is-eq (get status lease) STATUS_LISTED) (is-eq (get status lease) STATUS_FUNDED)) (err ERR_INVALID_LEASE_STATE))
+  (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender (get landowner lease)) (is-eq tx-sender (get hunter lease))) ERR_NOT_AUTHORIZED)
+    (asserts! (or (is-eq (get status lease) STATUS_LISTED) (is-eq (get status lease) STATUS_FUNDED)) ERR_INVALID_LEASE_STATE)
 
     (if (is-eq (get status lease) STATUS_FUNDED)
       (begin
-        (as-contract (stx-transfer? (get amount lease) tx-sender (get hunter lease)))
+        ;; Refund the hunter
+        (try! (as-contract (stx-transfer? (get amount lease) tx-sender (get hunter lease))))
         (map-set leases lease-id (merge lease { status: STATUS_CANCELED }))
+        (print { message: "lease canceled with refund", id: lease-id })
         (ok true)
       )
       (begin
+        ;; Just cancel the listing
         (map-set leases lease-id (merge lease { status: STATUS_CANCELED }))
+        (print { message: "lease canceled", id: lease-id })
+        (ok true)
+      )
+    )
+  )
+)
+
+;; --- Dispute Resolution (Future Enhancement) ---
+;; Marks a lease as disputed for manual resolution.
+(define-public (raise-dispute (lease-id uint))
+  (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender (get landowner lease)) (is-eq tx-sender (get hunter lease))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status lease) STATUS_ACTIVE) ERR_INVALID_LEASE_STATE)
+
+    (map-set leases lease-id (merge lease { status: STATUS_DISPUTED }))
+    (print { message: "dispute raised", id: lease-id, disputer: tx-sender })
+    (ok true)
+  )
+)
+
+;; --- Resolve Dispute (Admin Only) ---
+;; Contract owner can resolve disputes by releasing funds to the appropriate party.
+(define-public (resolve-dispute (lease-id uint) (release-to-landowner bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+      (asserts! (is-eq (get status lease) STATUS_DISPUTED) ERR_INVALID_LEASE_STATE)
+      
+      (let ((total-amount (get amount lease))
+            (fee-percent (var-get service-fee-percent))
+            (service-fee (/ (* total-amount fee-percent) u100))
+            (payout-amount (- total-amount service-fee))
+            (recipient (if release-to-landowner (get landowner lease) (get hunter lease))))
+        
+        (asserts! (> payout-amount u0) ERR_INVALID_AMOUNT)
+        
+        ;; Transfer service fee to contract owner
+        (try! (as-contract (stx-transfer? service-fee tx-sender CONTRACT_OWNER)))
+        ;; Transfer payout to designated recipient
+        (try! (as-contract (stx-transfer? payout-amount tx-sender recipient)))
+        
+        (map-set leases lease-id (merge lease { status: STATUS_COMPLETED }))
+        (print { message: "dispute resolved", id: lease-id, recipient: recipient, amount: payout-amount })
         (ok true)
       )
     )
@@ -159,29 +230,26 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; --- Release funds when both parties have confirmed ---
-(define-private (release-funds-if-confirmed (lease-id uint))
-  (let ((lease (unwrap! (map-get? leases lease-id) (err ERR_LEASE_NOT_FOUND))))
-    (if (and (get landowner-confirmed lease) (get hunter-confirmed lease))
-      (begin
-        (asserts! (is-eq (get status lease) STATUS_ACTIVE) (err ERR_INVALID_LEASE_STATE))
-        (let ((total-amount (get amount lease))
-              (fee-percent (var-get service-fee-percent))
-              (service-fee (/ (* total-amount fee-percent) u100))
-              (payout-amount (- total-amount service-fee)))
+(define-private (release-funds (lease-id uint))
+  (let ((lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND)))
+    (asserts! (and (get landowner-confirmed lease) (get hunter-confirmed lease)) ERR_INVALID_LEASE_STATE)
+    (asserts! (is-eq (get status lease) STATUS_ACTIVE) ERR_INVALID_LEASE_STATE)
+    
+    (let ((total-amount (get amount lease))
+          (fee-percent (var-get service-fee-percent))
+          (service-fee (/ (* total-amount fee-percent) u100))
+          (payout-amount (- total-amount service-fee)))
+      
+      (asserts! (> payout-amount u0) ERR_INVALID_AMOUNT)
 
-          (asserts! (> payout-amount u0) (err ERR_INVALID_AMOUNT))
+      ;; Transfer service fee to contract owner
+      (try! (as-contract (stx-transfer? service-fee tx-sender CONTRACT_OWNER)))
+      ;; Transfer payout to landowner
+      (try! (as-contract (stx-transfer? payout-amount tx-sender (get landowner lease))))
 
-          ;; Transfer service fee to contract owner
-          (as-contract (try! (stx-transfer? service-fee tx-sender CONTRACT_OWNER)))
-          ;; Transfer payout to landowner
-          (as-contract (try! (stx-transfer? payout-amount tx-sender (get landowner lease))))
-
-          (map-set leases lease-id (merge lease { status: STATUS_COMPLETED }))
-          (print { message: "funds released", id: lease-id, amount: payout-amount })
-          (ok true)
-        )
-      )
-      (ok false) ;; Not fully confirmed yet
+      (map-set leases lease-id (merge lease { status: STATUS_COMPLETED }))
+      (print { message: "funds released", id: lease-id, amount: payout-amount })
+      (ok true)
     )
   )
 )
@@ -200,4 +268,20 @@
 
 (define-read-only (get-service-fee)
   (var-get service-fee-percent)
+)
+
+(define-read-only (get-lease-status (lease-id uint))
+  (match (map-get? leases lease-id)
+    lease (ok (get status lease))
+    (err u404)
+  )
+)
+
+(define-read-only (is-lease-ready-for-completion (lease-id uint))
+  (match (map-get? leases lease-id)
+    lease (ok (and (is-eq (get status lease) STATUS_ACTIVE)
+                   (get landowner-confirmed lease)
+                   (get hunter-confirmed lease)))
+    (err u404)
+  )
 )
